@@ -89,10 +89,13 @@ void memrevifle(void *ptr, size_t len) {
  * supported is creating empty buffers and appending bytes to it.
  * The string buffer uses 2x preallocation on every realloc for O(N) append
  * behavior.  */
+ 
+ #define BUFFER_MAGIC 0x9527FABC
 
 typedef struct mp_buf {
+	int magic;
     unsigned char *b;
-    size_t len, free;
+    size_t len, free, max;
 } mp_buf;
 
 void *mp_realloc(lua_State *L, void *target, size_t osize,size_t nsize) {
@@ -111,13 +114,34 @@ mp_buf *mp_buf_new(lua_State *L) {
     buf = (mp_buf*)mp_realloc(L, NULL, 0, sizeof(*buf));
 
     buf->b = NULL;
-    buf->len = buf->free = 0;
+    buf->len = buf->free = buf->max = buf->magic = 0;
     return buf;
+}
+
+static int mp_new_buf(lua_State *L) {
+	size_t max;
+	mp_buf *buf = NULL;
+	
+	max = luaL_checkinteger(L, 1);
+	buf = (mp_buf*)mp_realloc(L, NULL, 0, sizeof(*buf));
+	buf->magic = BUFFER_MAGIC;
+	buf->max = max;
+	buf->len = 0;
+	buf->b = (unsigned char*)mp_realloc(L, NULL, 0, max);
+    buf->free = max;
+	lua_pushlightuserdata(L, (void *)buf);
+	return 1;
 }
 
 void mp_buf_append(lua_State *L, mp_buf *buf, const unsigned char *s, size_t len) {
     if (buf->free < len) {
+		if (buf->max != 0 && (buf->len + len > buf->max)) {
+			luaL_error(L,
+				"insufficient buffer, buf.max=%zu, buf.len=%zu, msg.len=%zu",
+				buf->max, buf->len, len);
+		}
         size_t newsize = (buf->len+len)*2;
+		newsize = (buf->max > 0 && newsize > buf->max) ? buf->max : newsize;
 
         buf->b = (unsigned char*)mp_realloc(L, buf->b, buf->len + buf->free, newsize);
         buf->free = newsize - buf->len;
@@ -130,6 +154,18 @@ void mp_buf_append(lua_State *L, mp_buf *buf, const unsigned char *s, size_t len
 void mp_buf_free(lua_State *L, mp_buf *buf) {
     mp_realloc(L, buf->b, buf->len + buf->free, 0); /* realloc to 0 = free */
     mp_realloc(L, buf, sizeof(*buf), 0);
+}
+
+static int mp_free_buf(lua_State *L) {
+	mp_buf *buf;
+	
+	buf = (mp_buf *)lua_touserdata(L, 1);
+	if (buf == NULL || buf->magic != BUFFER_MAGIC) {
+		return luaL_argerror(L, 0, "invalid buffer!");
+	}
+	
+	mp_buf_free(L, buf);
+	return 0;
 }
 
 /* ---------------------------- String cursor ----------------------------------
@@ -520,27 +556,45 @@ int mp_pack(lua_State *L) {
     if (!lua_checkstack(L, nargs))
         return luaL_argerror(L, 0, "Too many arguments for MessagePack pack.");
 
-    buf = mp_buf_new(L);
-    for(i = 1; i <= nargs; i++) {
-        /* Copy argument i to top of stack for _encode processing;
-         * the encode function pops it from the stack when complete. */
-        luaL_checkstack(L, 1, "in function mp_check");
-        lua_pushvalue(L, i);
+	if (lua_type(L, 1) == LUA_TLIGHTUSERDATA) {
+		buf = (mp_buf *)lua_touserdata(L, 1);
+		if (buf->magic != BUFFER_MAGIC) {
+			return luaL_argerror(L, 0, "invalid buffer!");
+		}
+		buf->len = 0;
+		buf->free = buf->max;
+		for(i = 2; i <= nargs; i++) {
+		    luaL_checkstack(L, 1, "in function mp_check");
+		    lua_pushvalue(L, i);
+		    mp_encode_lua_type(L,buf,0);
+		}
+		lua_pushlightuserdata(L, buf->b);
+		lua_pushinteger(L, buf->len);
+		return 2;
+	} else {
+		buf = mp_buf_new(L);
+		for(i = 1; i <= nargs; i++) {
+			/* Copy argument i to top of stack for _encode processing;
+			 * the encode function pops it from the stack when complete. */
+			luaL_checkstack(L, 1, "in function mp_check");
+			lua_pushvalue(L, i);
 
-        mp_encode_lua_type(L,buf,0);
+			mp_encode_lua_type(L,buf,0);
 
-        lua_pushlstring(L,(char*)buf->b,buf->len);
+			lua_pushlstring(L,(char*)buf->b,buf->len);
 
-        /* Reuse the buffer for the next operation by
-         * setting its free count to the total buffer size
-         * and the current position to zero. */
-        buf->free += buf->len;
-        buf->len = 0;
-    }
-    mp_buf_free(L, buf);
+			/* Reuse the buffer for the next operation by
+			 * setting its free count to the total buffer size
+			 * and the current position to zero. */
+			buf->free += buf->len;
+			buf->len = 0;
+		}
+		mp_buf_free(L, buf);
 
-    /* Concatenate all nargs buffers together */
-    lua_concat(L, nargs);
+		/* Concatenate all nargs buffers together */
+		lua_concat(L, nargs);
+	}
+    
     return 1;
 }
 
@@ -797,7 +851,12 @@ int mp_unpack_full(lua_State *L, int limit, int offset) {
     int cnt; /* Number of objects unpacked */
     int decode_all = (!limit && !offset);
 
-    s = luaL_checklstring(L,1,&len); /* if no match, exits */
+	if (lua_type(L, 1) == LUA_TLIGHTUSERDATA) {
+		s = (const char *)lua_touserdata(L, 1);
+		len = luaL_checkinteger(L, 2);
+	} else {
+		s = luaL_checklstring(L,1,&len); /* if no match, exits */
+	}
 
     if (offset < 0 || limit < 0) /* requesting negative off or lim is invalid */
         return luaL_error(L,
@@ -894,6 +953,8 @@ const struct luaL_Reg cmds[] = {
     {"unpack", mp_unpack},
     {"unpack_one", mp_unpack_one},
     {"unpack_limit", mp_unpack_limit},
+    {"new_buffer", mp_new_buf},
+	{"free_buffer", mp_free_buf},
     {0}
 };
 
